@@ -1,8 +1,6 @@
-import { experimental_evaluate } from "ai";
-import { typeSafeAi } from "@ai-sdk/typesafe-ai";
 import { config } from "./config";
 
-/** Models answer buy or sell. `hold` only appears on late blocks (no decision was made). */
+/** Models answer buy or sell; risk checks and skipped/late blocks can hold. */
 export type Action = "buy" | "sell" | "hold";
 
 /** What the model sees. Compact, relative, human-readable. */
@@ -44,9 +42,9 @@ const QUESTIONS = {
     type: "choice",
     instructions: {
       question: "Will MON be higher or lower than the current mid after `horizonBlocks` more blocks?",
-      goal: "Trade MON-USDC on Kuru. Blocks are ~300ms; `horizonBlocks` (~30 s) is the horizon. A decision is made every few blocks and held until the next one. The trade crosses the spread (`spreadBps`), so the move must beat that cost.",
-      timing: "The order executes as an immediate-or-cancel market order in the next block.",
-      inputs: "Taker flow is the strongest signal: `trades.cvdMon` (taker buys minus taker sells over the horizon), `trades.lastSide` and `recentTrades` show who is hitting the book. `depth` and `book` show resting liquidity per side at several distances from mid; thin depth on one side means price moves easily that way. `returnsBps` and `recentMids` show the path over the horizon. If `allowed.buy` is false the trade will be a sell regardless, and vice versa.",
+      goal: "Trade MON-USDC on Kuru. Blocks are ~300ms; `horizonBlocks` (~30 s) is the horizon. A decision is made every few blocks and held until the next one. Orders are post-only limit orders, not market orders. Consider adverse selection and uncertainty; a directional probability is not a guarantee of profitability.",
+      timing: "A post-only order rests inside or at the touch and may never fill.",
+      inputs: "Taker flow is the strongest signal: `trades.cvdMon` (taker buys minus taker sells over the horizon), `trades.lastSide` and `recentTrades` show who is hitting the book. `depth` and `book` show resting liquidity per side at several distances from mid; thin depth on one side means price moves easily that way. `returnsBps` and `recentMids` show the path over the horizon. If the selected side is not allowed, no order is placed.",
     },
     criteria: {
       buy: "Buy MON now: mid more likely to be higher after `horizonBlocks` blocks, by more than the spread.",
@@ -55,23 +53,32 @@ const QUESTIONS = {
   },
 } as const;
 
-/** Real Jev via the AI SDK. Swap-in is the MODEL env var. */
+/** Official TypeSafe HTTP API; secrets stay server-side. */
 export class JevModel implements Model {
   readonly name = config.jevModelId;
-  private model = typeSafeAi.evaluationModel(config.jevModelId);
 
   async decide(state: TradeState): Promise<Decision> {
     const t0 = performance.now();
-    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0 });
-    const a = r.answers.direction;
-    const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
-    const buy = p.buy ?? 0, sell = p.sell ?? 0;
+    const response = await fetch("https://api.typesafe.ai/v1/systemone", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + (process.env.TYPESAFE_API_KEY || process.env.TYPESAFE_AI_API_KEY) },
+      body: JSON.stringify({ model: config.jevModelId, state, questions: QUESTIONS }),
+      signal: AbortSignal.timeout(config.maxDecisionMs),
+    });
+    // Do not print upstream bodies: provider errors may contain private request details.
+    if (!response.ok) throw new Error("JEV request failed (HTTP " + response.status + "); no quote placed");
+    const r = await response.json() as { answers?: { direction?: { type?: string; choice?: string; probabilities?: Record<string, number> } }; usage?: { input_tokens?: number } };
+    const a = r.answers?.direction;
+    if (!a || a.type !== "choice" || !["buy", "sell"].includes(a.choice ?? "") || !a.probabilities) throw new Error("Invalid JEV decision; no quote placed");
+    const p = a.probabilities;
+    const buy = p.buy, sell = p.sell;
+    if (![buy, sell].every(x => typeof x === "number" && Number.isFinite(x) && x >= 0 && x <= 1) || Math.abs(buy! + sell! - 1) > 1e-6) throw new Error("Invalid JEV probabilities");
     return {
       action: a.choice as Action,
-      probabilities: { buy, sell, hold: 0 },
-      upIn10: buy,
+      probabilities: { buy: buy!, sell: sell!, hold: 0 },
+      upIn10: buy!,
       latencyMs: performance.now() - t0,
-      inputTokens: r.usage?.inputTokens ?? 0,
+      inputTokens: Number.isFinite(r.usage?.input_tokens) && r.usage!.input_tokens! >= 0 ? r.usage!.input_tokens! : 0,
     };
   }
 }

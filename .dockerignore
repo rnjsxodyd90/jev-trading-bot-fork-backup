@@ -3,3 +3,7 @@ node_modules
 data
 scripts
 .claude
+
+.env.*
+*.pem
+*.key

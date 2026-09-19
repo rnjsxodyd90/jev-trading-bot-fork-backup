@@ -17,8 +17,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Jev Trader",
-  description: "One AI trade decision every Monad block.",
+  title: "JEV Trading Bot | Paper Trading",
+  description: "MON/USDC paper-trading research with JEV and explicit risk controls. No real-money orders.",
 };
 
 export const viewport: Viewport = {

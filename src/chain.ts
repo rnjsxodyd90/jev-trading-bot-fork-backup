@@ -2,11 +2,14 @@ import { config } from "./config";
 
 /** Raw JSON-RPC call over HTTP. Defaults to the send RPC; pass `config.readRpcUrl` for reads. */
 export async function rpc<T = unknown>(method: string, params: unknown[] = [], url = config.rpcUrl): Promise<T> {
+  if (!["eth_blockNumber", "eth_getLogs", "eth_gasPrice", "eth_getTransactionReceipt", "eth_call", "eth_getTransactionCount", "eth_getBalance", "eth_getCode", "eth_getBlockByNumber", "eth_chainId", "eth_estimateGas"].includes(method)) throw new Error("Paper-only RPC: transaction methods blocked");
   const res = await fetch(url, {
+    signal: AbortSignal.timeout(5000),
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
+  if (!res.ok) throw new Error("RPC HTTP " + res.status);
   const json = (await res.json()) as { result?: T; error?: { code: number; message: string } };
   if (json.error) throw new Error(`${method}: ${json.error.message} (${json.error.code})`);
   return json.result as T;

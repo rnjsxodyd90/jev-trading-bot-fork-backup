@@ -68,7 +68,7 @@ interface Pending { block: number; quote: Quote; gasLimit: ethers.BigNumber }
 export class Market {
   readonly provider = new ethers.providers.StaticJsonRpcProvider(config.rpcUrl, config.chainId);
   /** null in a dry run (no key, or DRY_RUN=true): nothing is signed, nothing is sent. */
-  readonly wallet = config.dryRun ? null : new ethers.Wallet(config.privateKey!, this.provider);
+  readonly wallet: ethers.Wallet | null = null;
   params!: Kuru.MarketParams; // public so scripts can build txs without init()
   /** Margin account balances, refreshed every `config.refreshBlocks`. Limit orders draw from here. */
   margin = { mon: 0, usdc: 0 };
@@ -80,12 +80,17 @@ export class Market {
   private useVault = false;
   private pending = new Map<string, Pending>();
 
+  private assertPaperOnly() {
+    if (!config.dryRun || this.wallet) throw new Error("Paper-only market: signing and wallets are disabled");
+  }
+
   get address() { return this.wallet?.address ?? null; }
   private get priceDec() { return log10(this.params.pricePrecision); }
   private get sizeDec() { return log10(this.params.sizePrecision); }
   private get tickUnits() { return Number(this.params.tickSize.toString()); }
 
   async init() {
+    this.assertPaperOnly();
     this.params = await Kuru.ParamFetcher.getMarketParams(this.provider, config.market);
     await this.refresh();
     if (!this.wallet) return;
@@ -133,6 +138,7 @@ export class Market {
    * order. Returns as soon as the RPC has the hash. `pollPending` resolves placed/reverted later.
    */
   async send(block: number, side: Side, sizeMon: number, book: Book, cancel: number[], capped: boolean): Promise<Quote> {
+    this.assertPaperOnly();
     const price = this.quotePrice(side, book);
     if (!this.wallet) return { side, price, size: sizeMon, txHash: null, gasMon: 0, cancel, status: "sim", orderId: null, capped };
 

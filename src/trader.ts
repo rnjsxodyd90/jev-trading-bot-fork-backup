@@ -1,5 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { config } from "./config";
+import { RiskGate } from "./risk";
+import { validBook } from "./validate-book";
 import { Market, type Book, type Fill, type Quote, type QuoteResult, type Side } from "./market";
 import type { Action, Decision, Model, TradeState } from "./model";
 import { TradeFeed, type MakerFill, type TradePrint } from "./trades";
@@ -19,6 +21,7 @@ export interface BlockEvent {
   /** Our size known to be resting on the book after this block's order. */
   resting: { bidMon: number; askMon: number };
   position: { side: "long" | "short" | "flat"; size: number; entryPrice: number | null; unrealizedUsd: number; unrealizedMon: number };
+  risk: { paperOnly: true; reason: string | null; halted: boolean; modelCalls: number };
   totals: Totals;
 }
 
@@ -45,7 +48,7 @@ interface Resting { side: Side; price: number; size: number; block: number }
 
 /**
  * Every block: read the book, ask the model buy or sell, and post one post-only limit order on
- * that side (`quoteInsideTicks` inside the touch), cancelling whatever we had resting. One request
+ * that side when the risk gate allows it, cancelling whatever we had resting. One request
  * in flight; a block that arrives while the previous one is still running is emitted as late.
  *
  * Live sends are fire-and-forget: the block event carries the quote as `sent`; its receipt
@@ -64,6 +67,11 @@ export class Trader {
   /** Live quotes sent but not yet confirmed; they may become resting orders, so they count toward the cap. */
   private inflight = new Map<string, Quote>();
   private simId = 0;
+  private readonly risk = new RiskGate(config);
+  private riskReason: string | null = null;
+  private modelCalls = 0;
+  private lastDecisionBlock = -Infinity;
+  private newestBlock = 0;
   private position = { mon: 0, costUsd: 0 }; // signed inventory and its cost basis
   private totals: Totals = { blocks: 0, decisions: 0, quotes: 0, fills: 0, reverted: 0, lateBlocks: 0, jevUsd: 0, gasMon: 0, gasUsd: 0, realizedUsd: 0, pnlUsd: 0, pnlMon: 0, pnlPct: 0 };
 
@@ -74,6 +82,7 @@ export class Trader {
     private onFill: (block: number, fill: Fill) => void = () => {},
     private onQuote: (block: number, quote: Quote) => void = () => {},
   ) {
+    if (!config.dryRun || this.market.wallet) throw new Error("Paper-only trader cannot operate with a wallet");
     mkdirSync("data", { recursive: true });
   }
 
@@ -83,6 +92,7 @@ export class Trader {
   }
 
   async onBlock(block: number) {
+    this.newestBlock = Math.max(this.newestBlock, block);
     this.totals.blocks++;
     this.confirmPending(block); // off the hot path: receipts for earlier blocks' sends
     if (this.totals.blocks % config.refreshBlocks === 0) this.market.refresh().catch(() => {}); // fee estimate + margin + vault check
@@ -95,17 +105,32 @@ export class Trader {
     const t0 = performance.now();
     try {
       const book = await this.market.readBook();
+      if (!validBook(book)) throw new Error("Invalid book");
       const readMs = performance.now() - t0;
       this.lastBook = book;
       this.mids.push(book.mid);
       if (this.mids.length > 400) this.mids.shift();
-      this.trades?.poll(block).then(() => this.harvest()); // off the hot path: eth_getLogs for prints (and our fills) since the last poll
+      await this.trades?.poll(block);
+      this.harvest(); // Reconcile available prints before the risk check.
 
+      const pnl = this.totals.realizedUsd + this.unrealizedUsd(book.mid) - this.totals.gasMon * book.mid;
+      this.riskReason = this.risk.beforeDecision({ pnlUsd: pnl, modelCalls: this.modelCalls, spreadBps: book.spreadBps, bookBlock: book.block, currentBlock: block });
+      if (!this.riskReason && block - this.lastDecisionBlock < config.decisionEveryBlocks) this.riskReason = "decision_cooldown";
+      // Quotes expire at the next processed block; never leave an old simulated order resting on hold.
+      this.orders.clear();
+      if (this.riskReason) {
+        this.emit(block, book, null, null, false);
+        return;
+      }
+      this.lastDecisionBlock = block;
+      this.modelCalls++;
       const decision = await this.model.decide(this.buildState(block, book));
+      this.riskReason = this.risk.afterDecision(decision);
+      if (!this.riskReason && (performance.now() - t0 > config.maxDecisionMs || this.newestBlock - book.block > config.maxBookLagBlocks)) this.riskReason = "stale_decision";
       const wanted: Side = decision.action === "sell" ? "sell" : "buy";
-      const other: Side = wanted === "buy" ? "sell" : "buy";
-      // The position cap (and, live, margin funds) can only pick the reducing side. The probabilities still show the model's call.
-      const side: Side | null = this.allowed(wanted, book) ? wanted : this.allowed(other, book) ? other : null;
+      if (!this.riskReason && !this.allowed(wanted, book)) this.riskReason = "position_cap";
+      const side: Side | null = this.riskReason ? null : wanted;
+      if (this.riskReason) decision.action = "hold";
       this.totals.decisions++;
       this.totals.jevUsd += (decision.inputTokens / 1e6) * config.jevUsdPerMTok;
 
@@ -113,6 +138,7 @@ export class Trader {
       if (side) {
         decision.action = side;
         const cancel = [...this.orders.keys()].filter((id) => id > 0); // simulated orders have negative ids
+        if (!config.dryRun || this.market.wallet) throw new Error("Paper-only execution invariant failed");
         quote = await this.market.send(block, side, config.tradeSizeMon, book, cancel, side !== wanted);
         this.totals.quotes++;
         if (quote.status === "sim") {
@@ -124,7 +150,11 @@ export class Trader {
       }
       this.emit(block, book, decision, quote, false, { readMs: Math.round(readMs), loopMs: Math.round(performance.now() - t0) });
     } catch (e) {
-      console.error(`block ${block}:`, (e as Error).message);
+      this.orders.clear();
+      this.riskReason = "data_or_model_error";
+      // Deliberately redact provider details and URLs from logs.
+      console.error(`block ${block}: data/model error; no quote placed`);
+      if (this.lastBook) this.emit(block, this.lastBook, null, null, false);
     } finally {
       this.busy = false;
     }
@@ -152,7 +182,7 @@ export class Trader {
   private harvest() {
     if (!this.trades) return;
     const prints = this.trades.drainPrints();
-    const fills: Fill[] = this.market.wallet ? this.liveFills(this.trades.drainFills()) : this.simFills(prints);
+    const fills: Fill[] = this.simFills(prints);
     if (!fills.length) return;
     const byBlock = new Map<number, Fill[]>();
     for (const f of fills) {
@@ -278,6 +308,7 @@ export class Trader {
         ? { action: "hold", probabilities: { buy: 0, sell: 0, hold: 1 }, upIn10: 0.5, latencyMs: 0, late: true }
         : decision && { action: decision.action, probabilities: decision.probabilities, upIn10: decision.upIn10, latencyMs: Math.round(decision.latencyMs), late: false },
       quote,
+      risk: { paperOnly: true, reason: this.riskReason, halted: this.risk.haltedReason !== null, modelCalls: this.modelCalls },
       fill: null,
       resting: { bidMon: round(this.restingMon("buy"), 1), askMon: round(this.restingMon("sell"), 1) },
       position: {

@@ -48,7 +48,7 @@ export default function Header({ meta, latest, connection }: HeaderProps) {
 
   return (
     <div className={styles.header}>
-      <span className={styles.brand}>‖ Jev Trader</span>
+      <span className={styles.brand}>JEV Trading Bot</span>
 
       <span className={styles.block}>block {latest ? fmtInt(latest.block) : "-"}</span>
 
@@ -64,7 +64,7 @@ export default function Header({ meta, latest, connection }: HeaderProps) {
         title={wallet ?? "no wallet, dry run"}
         aria-label={wallet ? `Copy wallet address ${wallet}` : "Dry run"}
       >
-        {copied ? "copied" : wallet ? shortAddr(wallet) : "dry run"}
+        {copied ? "copied" : wallet ? shortAddr(wallet) : "paper only"}
       </button>
 
       {model ? (

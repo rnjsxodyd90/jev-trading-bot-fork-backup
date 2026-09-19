@@ -1,6 +1,15 @@
+import { RiskGate } from "./risk";
 const env = (key: string, fallback?: string) => process.env[key] ?? fallback;
 const num = (key: string) => (env(key) ? Number(env(key)) : undefined);
 
+// This research fork never signs transactions, even if a wallet key is accidentally supplied.
+if (env("PRIVATE_KEY")?.trim() || env("DRY_RUN", "true") !== "true") {
+  throw new Error("Paper-only build: remove PRIVATE_KEY and set DRY_RUN=true. No live trading is supported.");
+}
+if (!["mock", "jev"].includes(env("MODEL", "mock")!)) throw new Error("MODEL must be mock or jev");
+if (env("MODEL") === "jev" && !(env("TYPESAFE_API_KEY") || env("TYPESAFE_AI_API_KEY"))) {
+  throw new Error("MODEL=jev requires TYPESAFE_API_KEY (server-side only)");
+}
 export const config = {
   rpcUrl: env("RPC_URL", "https://rpc.monad.xyz")!, // sends, receipts, nonce, gas estimation
   readRpcUrl: env("READ_RPC_URL", "https://rpc.monad.xyz")!, // book reads + eth_blockNumber polling + trade logs
@@ -9,8 +18,8 @@ export const config = {
   market: env("MARKET", "0x065C9d28E428A0db40191a54d33d5b7c71a9C394")!, // Kuru MON-USDC
   /** Kuru MarginAccount this market settles against (slot 73 of the OrderBook proxy; verifiedMarket(market) is true). */
   marginAccount: env("MARGIN_ACCOUNT", "0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5")!,
-  privateKey: env("PRIVATE_KEY"),
-  dryRun: env("DRY_RUN") === "true" || !env("PRIVATE_KEY"),
+  privateKey: undefined as string | undefined,
+  dryRun: true,
   tradeSizeMon: Number(env("TRADE_SIZE_MON", "200")), // Kuru MON-USDC minimum order is 200 MON
   maxPositionMon: Number(env("MAX_POSITION_MON", "1000")),
   bankrollUsd: Number(env("BANKROLL_USD", "100")), // used for pnlPct
@@ -33,4 +42,27 @@ export const config = {
   jevUsdPerMTok: 0.042,
   port: Number(env("PORT", "3000")),
   historySize: 1000,
+  host: env("HOST", "127.0.0.1")!,
+  allowedOrigin: env("ALLOWED_ORIGIN", "http://localhost:3001")!,
+  minConfidence: Number(env("MIN_CONFIDENCE", "0.65")),
+  maxSessionLossUsd: Number(env("MAX_SESSION_LOSS_USD", "5")),
+  maxModelCalls: Number(env("MAX_MODEL_CALLS", "300")),
+  maxSpreadBps: Number(env("MAX_SPREAD_BPS", "50")),
+  maxBookLagBlocks: Number(env("MAX_BOOK_LAG_BLOCKS", "5")),
+  maxDecisionMs: Number(env("MAX_DECISION_MS", "1000")),
+  decisionEveryBlocks: Number(env("DECISION_EVERY_BLOCKS", "10")),
 };
+
+for (const key of ["tradeSizeMon", "maxPositionMon", "bankrollUsd", "horizonBlocks", "port", "decisionEveryBlocks"] as const) {
+  if (!Number.isFinite(config[key]) || config[key] <= 0) throw new Error(key + " must be positive and finite");
+}
+if (config.tradeSizeMon < 200 || config.tradeSizeMon > config.maxPositionMon) throw new Error("Trade size must be at least 200 MON and within the position cap");
+if (!Number.isInteger(config.decisionEveryBlocks) || !Number.isInteger(config.horizonBlocks) || !Number.isInteger(config.port) || config.port > 65535) throw new Error("Invalid integer configuration");
+if (!Number.isInteger(config.quoteInsideTicks) || config.quoteInsideTicks < 0) throw new Error("QUOTE_INSIDE_TICKS must be a nonnegative integer");
+
+// Validate every active risk limit before initializing RPC clients.
+new RiskGate(config);
+for (const key of ["maxFeeGwei", "priorityFeeGwei", "marginMon", "marginUsdc"] as const) {
+  if (!Number.isFinite(config[key]) || config[key] < 0) throw new Error(key + " must be finite and nonnegative");
+}
+if (config.gasLimit !== undefined && (!Number.isSafeInteger(config.gasLimit) || config.gasLimit <= 0)) throw new Error("Invalid GAS_LIMIT");
